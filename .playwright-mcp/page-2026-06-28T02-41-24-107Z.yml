@@ -1,0 +1,76 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - img [ref=e3]
+    - generic [ref=e6]: 已复制到剪贴板
+  - generic [ref=e7]:
+    - banner [ref=e8]:
+      - heading "Secrets 配置生成器" [level=1] [ref=e9]
+      - paragraph [ref=e10]: 轻松生成 GitHub Actions 配置文件，一键部署 AnyRouter 自动签到
+    - generic [ref=e11]:
+      - generic [ref=e12] [cursor=pointer]:
+        - generic [ref=e13]:
+          - img [ref=e14]
+          - text: 使用指南
+        - img [ref=e16]
+      - list [ref=e19]:
+        - listitem [ref=e20]: 填写下方账号信息（支持多账号）。
+        - listitem [ref=e21]:
+          - text: 点击底部的
+          - strong [ref=e22]: "\"生成配置\""
+          - text: 按钮。
+        - listitem [ref=e23]: 生成的 JSON 配置将显示在页面下方。
+        - listitem [ref=e24]:
+          - text: 在 GitHub 仓库设置中创建名为
+          - code [ref=e25]: production
+          - text: 的 Environment。
+        - listitem [ref=e26]:
+          - text: 将生成的配置项添加为 Secrets (如
+          - code [ref=e27]: ANYROUTER_ACCOUNTS
+          - text: )。
+    - generic [ref=e28]:
+      - generic [ref=e30] [cursor=pointer]:
+        - img [ref=e31]
+        - text: 账号配置 (ANYROUTER_ACCOUNTS)
+        - generic [ref=e36]: 必需
+      - generic [ref=e37]:
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - generic [ref=e41]: "账号 #1"
+            - button "删除" [ref=e42] [cursor=pointer]
+          - generic [ref=e43]:
+            - generic [ref=e44]:
+              - generic [ref=e45]: 服务商 (Provider)
+              - combobox [ref=e46]:
+                - option "anyrouter (默认)" [selected]
+                - option "agentrouter"
+            - generic [ref=e47]:
+              - generic [ref=e48]: 备注名称 (可选)
+              - 'textbox "例如: 我的主账号" [ref=e49]'
+          - generic [ref=e50]:
+            - generic [ref=e51]: Session Cookie *
+            - textbox "粘贴完整的 session 字符串..." [ref=e52]
+          - generic [ref=e53]:
+            - generic [ref=e54]: API User ID *
+            - textbox "自动提取中..." [ref=e56]
+            - generic [ref=e58] [cursor=pointer]:
+              - checkbox "从 Session 自动提取 (可能不准确)" [checked] [ref=e59]
+              - text: 从 Session 自动提取
+              - generic [ref=e60]: (可能不准确)
+        - button "添加另一个账号" [ref=e61] [cursor=pointer]:
+          - img [ref=e62]
+          - text: 添加另一个账号
+    - generic [ref=e64] [cursor=pointer]:
+      - generic [ref=e65]:
+        - img [ref=e66]
+        - text: 服务商配置 (PROVIDERS)
+        - generic [ref=e69]: 可选
+      - img [ref=e70]
+    - generic [ref=e73] [cursor=pointer]:
+      - generic [ref=e74]:
+        - img [ref=e75]
+        - text: 通知设置
+        - generic [ref=e78]: 可选
+      - img [ref=e79]
+    - button "生成配置代码" [ref=e81] [cursor=pointer]:
+      - img [ref=e82]
+      - text: 生成配置代码

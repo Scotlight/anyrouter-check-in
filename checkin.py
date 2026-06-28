@@ -10,12 +10,33 @@ import os
 import sys
 from datetime import datetime
 
-import httpx
-from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+if hasattr(sys.stdout, 'reconfigure'):
+	sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, 'reconfigure'):
+	sys.stderr.reconfigure(line_buffering=True)
 
+import httpx
+from cloakbrowser import launch_async
+from dotenv import load_dotenv
+
+from utils.browser import (
+	BrowserLoginResult,
+	has_session_cookie,
+	is_logged_in,
+	launch_login_context,
+	load_browser_login_settings,
+	login_with_email_form,
+	navigate_login_page,
+	prepare_browser_page,
+	save_login_screenshot,
+	take_pending_screenshots,
+	verify_browser_login,
+	wait_for_waf_ready,
+)
 from utils.config import AccountConfig, AppConfig, load_accounts_config
+from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
+from utils.proxy import get_playwright_proxy, get_proxy_server
 
 load_dotenv()
 
@@ -44,8 +65,9 @@ def save_balance_hash(balance_hash):
 
 def generate_balance_hash(balances):
 	"""生成余额数据的hash"""
-	# 将包含 quota 和 used 的结构转换为简单的 quota 值用于 hash 计算
-	simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
+	simple_balances = (
+		{k: {'quota': v.get('quota'), 'used': v.get('used')} for k, v in balances.items()} if balances else {}
+	)
 	balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
@@ -65,218 +87,151 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
-	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
-
-	async with async_playwright() as p:
-		import tempfile
-
-		with tempfile.TemporaryDirectory() as temp_dir:
-			context = await p.chromium.launch_persistent_context(
-				user_data_dir=temp_dir,
-				headless=False,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1920, 'height': 1080},
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--disable-web-security',
-					'--disable-features=VizDisplayCompositor',
-					'--no-sandbox',
-				],
-			)
-
-			page = await context.new_page()
-
-			try:
-				print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
-
-				await page.goto(login_url, wait_until='networkidle')
-
-				try:
-					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-				except Exception:
-					await page.wait_for_timeout(3000)
-
-				cookies = await page.context.cookies()
-
-				waf_cookies = {}
-				for cookie in cookies:
-					cookie_name = cookie.get('name')
-					cookie_value = cookie.get('value')
-					if cookie_name in required_cookies and cookie_value is not None:
-						waf_cookies[cookie_name] = cookie_value
-
-				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
-
-				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
-
-				if missing_cookies:
-					print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-					await context.close()
-					return None
-
-				print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-
-				await context.close()
-
-				return waf_cookies
-
-			except Exception as e:
-				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-				await context.close()
-				return None
-
-
-async def login_with_password(
+async def get_waf_cookies_with_browser(
 	account_name: str,
 	login_url: str,
-	username: str,
+	required_cookies: list[str],
+	*,
+	use_proxy: bool = False,
+):
+	"""使用浏览器获取 WAF cookies"""
+	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+
+	launch_kwargs: dict = {'headless': True}
+	proxy = get_playwright_proxy(use_proxy=use_proxy)
+	if proxy:
+		launch_kwargs['proxy'] = proxy
+	browser = await launch_async(**launch_kwargs)
+
+	try:
+		page = await browser.new_page()
+		await prepare_browser_page(page)
+		print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
+
+		await page.goto(login_url, wait_until='domcontentloaded')
+		await wait_for_waf_ready(page)
+
+		cookies = await page.context.cookies()
+
+		waf_cookies = {}
+		for cookie in cookies:
+			cookie_name = cookie.get('name')
+			cookie_value = cookie.get('value')
+			if cookie_name in required_cookies and cookie_value is not None:
+				waf_cookies[cookie_name] = cookie_value
+
+		print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
+
+		missing_cookies = [c for c in required_cookies if c not in waf_cookies]
+
+		if missing_cookies:
+			print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+			await browser.close()
+			return None
+
+		print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
+		await browser.close()
+		return waf_cookies
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
+		await browser.close()
+		return None
+
+
+async def login_with_credentials(
+	account_name: str,
+	provider_config,
+	provider_name: str,
+	email: str,
 	password: str,
-	api_user_key: str = 'new-api-user',
-	waf_cookie_names: list[str] | None = None,
-) -> tuple[dict | None, str | None]:
-	"""使用 Playwright 通过账号密码登录（适用于「登录即签到」平台）
+) -> BrowserLoginResult | None:
+	"""使用邮箱密码通过浏览器登录，返回 cookies 与拦截到的 api user id。"""
+	print(f'[PROCESSING] {account_name}: Logging in with email/password...')
 
-	每次使用全新临时 user_data_dir，等价于退出后重新登录。
-	返回 (cookies_dict, api_user)，登录失败返回 (None, None)。
-	"""
-	print(f'[PROCESSING] {account_name}: Starting browser to login with credentials...')
+	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	settings = load_browser_login_settings(
+		account_name,
+		provider_name,
+		persist_profile=provider_config.persist_profile,
+	)
+	timeout_ms = settings.wait_timeout_ms
 
-	async with async_playwright() as p:
-		import tempfile
+	debug_print(
+		f'[INFO] {account_name}: Browser profile={settings.profile_dir}, '
+		f'persist={settings.persist_profile}, headless={settings.headless}, '
+		f'humanize={settings.humanize}, timeout={timeout_ms}ms'
+	)
 
-		with tempfile.TemporaryDirectory() as temp_dir:
-			context = await p.chromium.launch_persistent_context(
-				user_data_dir=temp_dir,
-				headless=False,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1920, 'height': 1080},
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--disable-web-security',
-					'--disable-features=VizDisplayCompositor',
-					'--no-sandbox',
-				],
+	print(
+		f'[INFO] {account_name}: Provider proxy={"enabled" if provider_config.use_proxy else "disabled"} '
+		f'({provider_name})'
+	)
+
+	try:
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
+
+		if not await is_logged_in(page):
+			if await has_session_cookie(page):
+				print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
+			await save_login_screenshot(page, provider_name, account_name, 'before-email-login')
+			await login_with_email_form(
+				page,
+				email,
+				password,
+				timeout_ms,
+				provider=provider_name,
+				account_name=account_name,
 			)
+		else:
+			print(f'[INFO] {account_name}: Browser profile already logged in')
 
-			page = await context.new_page()
+		console_url = f'{provider_config.domain}/console'
+		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		if not user_profile:
+			cookies = await context.cookies()
+			cookie_names = [c.get('name') for c in cookies if c.get('name')]
+			print(f'[FAILED] {account_name}: Login failed - /api/user/self not verified')
+			debug_print(f'[INFO] {account_name}: Current URL: {page.url}')
+			debug_print(f'[INFO] {account_name}: Got cookies: {cookie_names}')
+			await save_login_screenshot(page, provider_name, account_name, 'not-authenticated')
+			await context.close()
+			return None
 
-			# 登录成功后才开始拦截请求，抓取 api_user
-			captured_api_user = None
-			listen_enabled = False
+		cookies = await context.cookies()
+		all_cookies = {
+			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
+		}
+		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
 
-			def on_request(request):
-				nonlocal captured_api_user
-				if not listen_enabled or captured_api_user:
-					return
-				headers = request.headers
-				for key, value in headers.items():
-					if key.lower() == api_user_key.lower() and value:
-						# 过滤掉未登录时的无效值（-1、0 等）
-						try:
-							if int(value) <= 0:
-								continue
-						except ValueError:
-							pass
-						captured_api_user = value
-						print(f'[INFO] {account_name}: Captured api_user={value} from request header')
-						break
+		success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
+		if is_debug_enabled() and api_user:
+			success_msg += f', api_user={api_user}'
+		print(success_msg)
+		await context.close()
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
 
-			page.on('request', on_request)
-
-			try:
-				print(f'[PROCESSING] {account_name}: Opening login page {login_url}...')
-				await page.goto(login_url, wait_until='networkidle')
-
-				try:
-					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-				except Exception:
-					await page.wait_for_timeout(3000)
-
-				# 点击「使用 邮箱或用户名 登录」按钮切换到账号密码表单
-				try:
-					email_login_btn = page.locator(
-						'button:has-text("邮箱"), button:has-text("用户名"), button:has-text("账号")'
-					).first
-					if await email_login_btn.count() > 0:
-						await email_login_btn.click()
-						await page.wait_for_timeout(500)
-						print(f'[INFO] {account_name}: Switched to email/username login form')
-				except Exception:
-					pass
-
-				# 填写用户名
-				username_input = page.locator('input[name="username"], input[id="username"]').first
-				if await username_input.count() == 0:
-					username_input = page.locator(
-						'input:not([type="password"]):not([type="hidden"]):not([type="checkbox"])'
-					).first
-				await username_input.fill(username)
-
-				# 填写密码
-				password_input = page.locator('input[type="password"]').first
-				await password_input.fill(password)
-
-				print(f'[INFO] {account_name}: Credentials filled, submitting login form...')
-
-				# 点击登录按钮
-				submit_btn = page.locator('button[type="submit"]').first
-				if await submit_btn.count() == 0:
-					submit_btn = page.locator(
-						'button:has-text("登录"), button:has-text("Login"), button:has-text("Sign in")'
-					).first
-				await submit_btn.click()
-
-				# 等待登录成功：URL 离开 /login 页
-				try:
-					await page.wait_for_url(lambda url: '/login' not in url, timeout=20000)
-				except Exception:
-					await page.wait_for_load_state('networkidle', timeout=20000)
-
-				await page.wait_for_timeout(2000)
-
-				current_url = page.url
-				if '/login' in current_url:
-					print(f'[FAILED] {account_name}: Login failed, still on login page ({current_url})')
-					await context.close()
-					return None, None
-
-				print(f'[SUCCESS] {account_name}: Login successful, redirected to {current_url}')
-
-				# 登录成功，开始拦截请求以抓取 api_user
-				listen_enabled = True
-				# 刷新页面让前端用已登录身份发 API 请求
-				await page.reload(wait_until='networkidle')
-				await page.wait_for_timeout(3000)
-
-				# 提取浏览器中的所有 cookies
-				cookies = await page.context.cookies()
-				cookie_dict = {c['name']: c['value'] for c in cookies if c.get('value')}
-				print(f'[INFO] {account_name}: Got {len(cookie_dict)} cookies after login')
-
-				if 'session' not in cookie_dict:
-					print(f'[WARNING] {account_name}: "session" cookie not found, login may not have completed')
-
-				if waf_cookie_names:
-					missing = [c for c in waf_cookie_names if c not in cookie_dict]
-					if missing:
-						print(f'[WARNING] {account_name}: Missing WAF cookies after login: {missing}')
-
-				if captured_api_user:
-					print(f'[SUCCESS] {account_name}: Auto-detected api_user: {captured_api_user}')
-				else:
-					print(f'[WARNING] {account_name}: Could not auto-detect api_user from network requests')
-
-				await context.close()
-				return cookie_dict, captured_api_user
-
-			except Exception as e:
-				print(f'[FAILED] {account_name}: Error occurred during password login: {e}')
-				await context.close()
-				return None, None
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error during login: {e}')
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'login-error')
+		await context.close()
+		return None
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -307,7 +262,12 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 
 	if provider_config.needs_waf_cookies():
 		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, provider_config.waf_cookie_names)
+		waf_cookies = await get_waf_cookies_with_browser(
+			account_name,
+			login_url,
+			provider_config.waf_cookie_names,
+			use_proxy=provider_config.use_proxy,
+		)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
 			return None
@@ -337,7 +297,6 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 				return True
 			else:
 				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				# 检查是否是"已经签到过"的情况，这种情况也算成功
 				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
 				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
 					print(f'[SUCCESS] {account_name}: Already checked in today')
@@ -345,7 +304,6 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
 				return False
 		except json.JSONDecodeError:
-			# 如果不是 JSON 响应，检查是否包含成功标识
 			if 'success' in response.text.lower():
 				print(f'[SUCCESS] {account_name}: Check-in successful!')
 				return True
@@ -358,50 +316,36 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 
 
 def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息
-
-	Args:
-		detail: 包含签到详情的字典
-
-	Returns:
-		格式化后的通知消息
-	"""
+	"""格式化签到通知消息"""
 	lines = [
 		f'[CHECK-IN] {detail["name"]}',
 		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  📍 签到前',
-		f'     💵 余额: ${detail["before_quota"]:.2f}  |  📊 累计消耗: ${detail["before_used"]:.2f}',
-		'  📍 签到后',
-		f'     💵 余额: ${detail["after_quota"]:.2f}  |  📊 累计消耗: ${detail["after_used"]:.2f}',
+		'  签到前',
+		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
+		'  签到后',
+		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
 	]
 
-	# 判断是否有变化
 	has_reward = detail['check_in_reward'] != 0
 	has_usage = detail['usage_increase'] != 0
 
 	if has_reward or has_usage:
 		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
 
-		# 已签到但期间有使用
 		if not has_reward and has_usage:
-			lines.append('  ℹ️  今日已签到（期间有使用）')
+			lines.append('  今日已签到（期间有使用）')
 
-		# 签到获得
 		if has_reward:
-			lines.append(f'  🎁 签到获得: +${detail["check_in_reward"]:.2f}')
+			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
 
-		# 期间消耗
 		if has_usage:
-			lines.append(f'  📉 期间消耗: ${detail["usage_increase"]:.2f}')
+			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
 
-		# 余额变化
 		if detail['balance_change'] != 0:
 			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			change_emoji = '📈' if detail['balance_change'] > 0 else '📉'
-			lines.append(f'  {change_emoji} 余额变化: {change_symbol}${detail["balance_change"]:.2f}')
+			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
 	else:
-		# 无任何变化
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  ℹ️  今日已签到，无变化'])
+		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
 
 	return '\n'.join(lines)
 
@@ -418,88 +362,143 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
+	# 邮箱密码优先
+	all_cookies = None
+	resolved_api_user: str | None = None
+	auth_method = None
 	if account.has_login_credentials():
-		# 账号密码登录：适用于 AgentRouter 等「登录即签到」平台
-		assert account.email and account.password
-		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		all_cookies, captured_api_user = await login_with_password(
+		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
+		assert account.email is not None and account.password is not None
+		login_result = await login_with_credentials(
 			account_name,
-			login_url,
+			provider_config,
+			account.provider,
 			account.email,
 			account.password,
-			provider_config.api_user_key,
-			provider_config.waf_cookie_names,
 		)
-		if not all_cookies:
+		if login_result:
+			all_cookies = login_result.cookies
+			resolved_api_user = login_result.api_user
+			auth_method = 'email/password'
+		else:
+			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			return False, None, None
-		# 优先用自动抓取的 api_user，其次用配置里手动填的
-		effective_api_user = captured_api_user or account.api_user
 	else:
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
-
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-		if not all_cookies:
-			return False, None, None
-		effective_api_user = account.api_user
+		auth_method = 'session cookies'
 
-	client = httpx.Client(http2=True, timeout=30.0)
+	if not all_cookies:
+		return False, None, None
 
+	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+
+	return run_check_in_requests(
+		all_cookies,
+		account,
+		account_name,
+		provider_config,
+		api_user_override=resolved_api_user,
+		use_proxy=provider_config.use_proxy,
+	)
+
+
+def run_check_in_requests(
+	all_cookies: dict,
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	*,
+	api_user_override: str | None = None,
+	use_proxy: bool = False,
+) -> tuple[bool, dict | None, dict | None]:
+	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
-		client.cookies.update(all_cookies)
+		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
+		proxy_url = get_proxy_server(use_proxy=use_proxy)
+		if proxy_url:
+			client_kwargs['proxy'] = proxy_url
+			if is_debug_enabled():
+				print(f'[INFO] {account_name}: HTTP client proxy enabled: {proxy_url}')
+			else:
+				print(f'[INFO] {account_name}: HTTP client proxy enabled')
+		elif use_proxy:
+			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
 
-		headers = {
-			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-			'Accept': 'application/json, text/plain, */*',
-			'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-			'Accept-Encoding': 'gzip, deflate, br, zstd',
-			'Referer': provider_config.domain,
-			'Origin': provider_config.domain,
-			'Connection': 'keep-alive',
-			'Sec-Fetch-Dest': 'empty',
-			'Sec-Fetch-Mode': 'cors',
-			'Sec-Fetch-Site': 'same-origin',
-			provider_config.api_user_key: effective_api_user,
-		}
+		with httpx.Client(**client_kwargs) as client:
+			client.cookies.update(all_cookies)
 
-		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
-		if user_info_before and user_info_before.get('success'):
-			print(user_info_before['display'])
-		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+			headers = {
+				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				'Accept': 'application/json, text/plain, */*',
+				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+				'Accept-Encoding': 'gzip, deflate, br, zstd',
+				'Referer': provider_config.domain,
+				'Origin': provider_config.domain,
+				'Connection': 'keep-alive',
+				'Sec-Fetch-Dest': 'empty',
+				'Sec-Fetch-Mode': 'cors',
+				'Sec-Fetch-Site': 'same-origin',
+			}
 
-		if provider_config.needs_manual_check_in():
-			success = execute_check_in(client, account_name, provider_config, headers)
-			# 签到后再次获取用户信息，用于计算签到收益
+			api_user = api_user_override or account.api_user
+			if api_user:
+				headers[provider_config.api_user_key] = api_user
+
+			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+			user_info_before = get_user_info(client, headers, user_info_url)
+			if user_info_before and user_info_before.get('success'):
+				print(user_info_before['display'])
+			elif user_info_before:
+				print(user_info_before.get('error', 'Unknown error'))
+
+			if provider_config.needs_manual_check_in():
+				success = execute_check_in(client, account_name, provider_config, headers)
+				user_info_after = get_user_info(client, headers, user_info_url)
+				return success, user_info_before, user_info_after
+
 			user_info_after = get_user_info(client, headers, user_info_url)
-			return success, user_info_before, user_info_after
-		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
-			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			if user_info_after and user_info_after.get('success'):
+				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+				return True, user_info_before, user_info_after
+			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
+			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
+			return False, user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
 		return False, None, None
-	finally:
-		client.close()
 
 
 async def main():
 	"""主函数"""
-	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
+	if is_debug_enabled():
+		print('[INFO] DEBUG_MODE enabled')
+		proxy_server = os.getenv('CHECKIN_PROXY_URL', '').strip()
+		if proxy_server:
+			print(f'[INFO] Proxy endpoint available: {proxy_server} (enabled per provider use_proxy)')
+		else:
+			print('[INFO] CHECKIN_PROXY_URL not set; providers with use_proxy=true will run without proxy')
+	else:
+		print('[INFO] Debug mode disabled (set DEBUG_MODE=true to enable screenshots and verbose logs)')
+
+	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started')
 	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
+	if is_debug_enabled():
+		for provider_name, provider in sorted(app_config.providers.items()):
+			print(f'[INFO] Provider "{provider_name}": use_proxy={provider.use_proxy}')
 
 	accounts = load_accounts_config()
 	if not accounts:
-		print('[FAILED] Unable to load account configuration, program exits')
+		error_msg = '[FAILED] Unable to load account configuration, program exits'
+		print(error_msg)
+		notify.push_message('AnyRouter Check-in Alert', error_msg, msg_type='text')
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
@@ -510,9 +509,9 @@ async def main():
 	total_count = len(accounts)
 	notification_content = []
 	current_balances = {}
-	account_check_in_details = {}  # 存储每个账号的签到详情
-	need_notify = False  # 是否需要发送通知
-	balance_changed = False  # 余额是否有变化
+	account_check_in_details = {}
+	need_notify = False
+	balance_changed = False
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
@@ -529,30 +528,22 @@ async def main():
 				account_name = account.get_display_name(i)
 				print(f'[NOTIFY] {account_name} failed, will send notification')
 
-			# 存储签到前后的余额信息
 			if user_info_after and user_info_after.get('success'):
 				current_quota = user_info_after['quota']
 				current_used = user_info_after['used_quota']
 				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
 
-				# 计算签到收益
 				if user_info_before and user_info_before.get('success'):
 					before_quota = user_info_before['quota']
 					before_used = user_info_before['used_quota']
 					after_quota = user_info_after['quota']
 					after_used = user_info_after['used_quota']
 
-					# 计算总额度（余额 + 历史消耗）
 					total_before = before_quota + before_used
 					total_after = after_quota + after_used
 
-					# 签到获得的额度 = 总额度增加量
 					check_in_reward = total_after - total_before
-
-					# 本次消耗 = 历史消耗增加量
 					usage_increase = after_used - before_used
-
-					# 余额变化
 					balance_change = after_quota - before_quota
 
 					account_check_in_details[account_key] = {
@@ -561,9 +552,9 @@ async def main():
 						'before_used': before_used,
 						'after_quota': after_quota,
 						'after_used': after_used,
-						'check_in_reward': check_in_reward,  # 签到获得
-						'usage_increase': usage_increase,  # 本次消耗
-						'balance_change': balance_change,  # 余额变化
+						'check_in_reward': check_in_reward,
+						'usage_increase': usage_increase,
+						'balance_change': balance_change,
 						'success': success,
 					}
 
@@ -580,46 +571,36 @@ async def main():
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
-			need_notify = True  # 异常也需要通知
+			need_notify = True
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 
-	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
 		if last_balance_hash is None:
-			# 首次运行
 			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] First run detected, will send notification with current balances')
 		elif current_balance_hash != last_balance_hash:
-			# 余额有变化
 			balance_changed = True
 			need_notify = True
 			print('[NOTIFY] Balance changes detected, will send notification')
 		else:
 			print('[INFO] No balance changes detected')
 
-	# 为有余额变化的情况添加所有成功账号到通知内容
 	if balance_changed:
 		for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			if account_key in account_check_in_details:
 				detail = account_check_in_details[account_key]
 				account_name = detail['name']
-
-				# 使用格式化函数生成通知消息
 				account_result = format_check_in_notification(detail)
-
-				# 检查是否已经在通知内容中（避免重复）
 				if not any(account_name in item for item in notification_content):
 					notification_content.append(account_result)
 
-	# 保存当前余额hash
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
 	if need_notify and notification_content:
-		# 构建通知内容
 		summary = [
 			'[STATS] Check-in result statistics:',
 			f'[SUCCESS] Success: {success_count}/{total_count}',
@@ -636,6 +617,17 @@ async def main():
 		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
 
 		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
+		screenshot_paths = take_pending_screenshots() if is_debug_enabled() else []
+		if screenshot_paths:
+			github_run_id = os.getenv('GITHUB_RUN_ID', '').strip()
+			github_repo = os.getenv('GITHUB_REPOSITORY', '').strip()
+			screenshot_hint = f'[SCREENSHOT] {len(screenshot_paths)} debug screenshot(s) saved'
+			if github_run_id and github_repo:
+				run_url = f'https://github.com/{github_repo}/actions/runs/{github_run_id}'
+				screenshot_hint += f'. Download artifact `checkin-screenshots-{github_run_id}` from: {run_url}'
+			else:
+				screenshot_hint += ' to `checkin_screenshots/`'
+			notify_content += f'\n\n{screenshot_hint}'
 
 		print(notify_content)
 		notify.push_message('AnyRouter Check-in Alert', notify_content, msg_type='text')
@@ -643,7 +635,6 @@ async def main():
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
-	# 设置退出码
 	sys.exit(0 if success_count > 0 else 1)
 
 

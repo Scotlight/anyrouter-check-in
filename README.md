@@ -19,7 +19,6 @@
 
 - ✅ 多平台（兼容 NewAPI 与 OneAPI）
 - ✅ 单个/多账号自动签到
-- ✅ 支持密码登录签到（适用于 AgentRouter 等「登录即签到」平台）
 - ✅ 多种机器人通知（可选）
 - ✅ 绕过 WAF 限制
 
@@ -33,19 +32,8 @@
 
 对于每个需要签到的账号，你需要获取：(可借助 [在线 Secrets 配置生成器](https://scotlight.github.io/anyrouter-check-in/))
 
-支持两种签到模式：
-
-#### 模式一：Cookie 模式（适用于 AnyRouter 等）
-
 1. **Cookies**: 用于身份验证
 2. **API User**: 用于请求头的 new-api-user 参数（自己配置其它平台时该值需要注意匹配）
-
-#### 模式二：密码登录模式（适用于 AgentRouter 等「登录即签到」平台）
-
-1. **Email**: 登录邮箱或用户名
-2. **Password**: 登录密码
-
-> AgentRouter 的签到机制是「退出重新登录」才算签到，使用密码登录模式时脚本会自动通过 Playwright 模拟登录流程完成签到，`api_user` 会从登录后的网络请求中自动获取，无需手动填写。
 
 #### 获取 Cookies：
 
@@ -72,38 +60,29 @@
 
 ### 4. 多账号配置格式
 
-支持单个与多个账号配置，支持 Cookie 模式和密码登录模式：
+支持单个与多个账号配置，可选 `name` 和 `provider` 字段：
 
 ```json
 [
   {
     "name": "我的主账号",
-    "cookies": {
-      "session": "account1_session_value"
-    },
-    "api_user": "account1_api_user_id"
+    "email": "account1@example.com",
+    "password": "account1_password"
   },
   {
-    "name": "AgentRouter 账号",
+    "name": "备用账号",
     "provider": "agentrouter",
-    "email": "your@email.com",
-    "password": "yourpassword"
+    "email": "account2@example.com",
+    "password": "account2_password"
   }
 ]
 ```
 
 **字段说明**：
 
-**Cookie 模式（二选一）**：
-- `cookies` (必需)：用于身份验证的 cookies 数据
-- `api_user` (必需)：用于请求头的 new-api-user 参数
-
-**密码登录模式（二选一）**：
-- `email` (必需)：登录邮箱或用户名
-- `password` (必需)：登录密码
-- `api_user` 会自动从登录后的网络请求中获取，无需手动填写
-
-**通用字段**：
+- `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
+- `cookies`：兼容旧版的 session cookies 登录方式
+- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -113,7 +92,7 @@
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
 - `anyrouter` 与 `agentrouter` 配置已内置，无需填写
 
-接下来获取 cookies 与 api_user 的值。
+如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
 通过 F12 工具，切到 Application 面板，拿到 session 的值，最好重新登录下，该值 1 个月有效期，但有可能提前失效，失效后报 401 错误，到时请再重新获取。
 
@@ -176,9 +155,9 @@
 ]
 ```
 
-### 多服务商配置（含密码登录模式）
+### 多服务商配置
 
-如果你需要同时使用多个服务商，Cookie 模式和密码登录模式可以混用：
+如果你需要同时使用多个服务商（如 anyrouter 和 agentrouter）：
 
 ```json
 [
@@ -191,10 +170,12 @@
     "api_user": "user123"
   },
   {
-    "name": "AgentRouter 账号",
+    "name": "AgentRouter 备用",
     "provider": "agentrouter",
-    "email": "your@email.com",
-    "password": "yourpassword"
+    "cookies": {
+      "session": "xyz789session"
+    },
+    "api_user": "user456"
   }
 ]
 ```
@@ -236,7 +217,7 @@
 **关于 `bypass_method`**：
 
 - 不设置或设置为 `null`：直接使用用户提供的 cookies 进行请求（适合无 WAF 保护的网站）
-- 设置为 `"waf_cookies"`：使用 Playwright 打开浏览器获取 WAF cookies 后再进行请求（适合有 WAF 保护的网站）
+- 设置为 `"waf_cookies"`：使用 CloakBrowser 打开浏览器获取 WAF cookies 后再进行请求（适合有 WAF 保护的网站）
 
 > 注：`anyrouter` 和 `agentrouter` 已内置默认配置，无需在 `PROVIDERS` 中配置
 
@@ -255,7 +236,7 @@
 - `user_info_path` (可选)：用户信息 API 路径，默认为 `/api/user/self`
 - `api_user_key` (可选)：API 用户标识请求头名称，默认为 `new-api-user`
 - `bypass_method` (可选)：WAF 绕过方法
-  - `"waf_cookies"`：使用 Playwright 打开浏览器获取 WAF cookies 后再执行签到
+  - `"waf_cookies"`：使用 CloakBrowser 打开浏览器获取 WAF cookies 后再执行签到
   - 不设置或 `null`：直接使用用户 cookies 执行签到（适合无 WAF 保护的网站）
 - `waf_cookie_names` (可选)：绕过 WAF 所需 cookie 的名称列表，`bypass_method` 为 `waf_cookies` 时必须设置
 
@@ -280,13 +261,31 @@
   - `bypass_method: "waf_cookies"`（需要先获取 WAF cookies，然后执行签到）
   - `sign_in_path: "/api/user/sign_in"`
 - `agentrouter`：
-  - `bypass_method: null`（直接使用用户 cookies 执行签到）
-  - `sign_in_path: "/api/user/sign_in"`
+  - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
+  - `sign_in_path: null`（查询用户信息时自动签到）
+  - `use_proxy: true`
 
 **重要提示**：
 
 - `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter` 和 `agentrouter`
 - 自定义的 provider 配置会覆盖同名的默认配置
+
+## 代理配置（可选）
+
+内置的 `agentrouter` 默认 `use_proxy: true`。如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
+
+在仓库 Settings -> Environments -> production -> Environment secrets 中添加：
+
+- `PROXY_SUBSCRIPTION_URL`：Clash/Mihomo 订阅链接。设置后，workflow 会运行 `scripts/setup_mihomo_proxy.sh`，启动本地代理并写入 `CHECKIN_PROXY_URL`。
+
+本地运行时也可以直接使用已有代理：
+
+```bash
+CHECKIN_PROXY_URL=http://127.0.0.1:7890
+PROVIDERS={"agentrouter":{"use_proxy":true}}
+```
+
+如果使用订阅脚本，默认会用 `https://www.google.com/generate_204` 测试代理连通性；也可以通过 `PROXY_TEST_URL` 覆盖。
 
 ## 开启通知
 
@@ -360,13 +359,16 @@
 # 安装所有依赖
 uv sync --dev
 
-# 安装 Playwright 浏览器
-uv run playwright install chromium
+# 安装 CloakBrowser 浏览器
+uv run python -m cloakbrowser install
+# 如需使用本地浏览器，可设置 CLOAKBROWSER_BINARY_PATH=/path/to/browser
 
 # 创建 .env 文件并配置（注意：JSON 必须是单行格式）
 # 示例：
-# ANYROUTER_ACCOUNTS=[{"name":"账号1","cookies":{"session":"xxx"},"api_user":"12345"}]
+# ANYROUTER_ACCOUNTS=[{"name":"账号1","email":"your@email.com","password":"your_password"}]
 # PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org"}}
+# PROXY_SUBSCRIPTION_URL=https://example.com/sub?token=xxx
+# CHECKIN_PROXY_URL=http://127.0.0.1:7890
 
 # 运行签到脚本
 uv run checkin.py
@@ -377,8 +379,8 @@ uv run checkin.py
 ```bash
 uv sync --dev
 
-# 安装 Playwright 浏览器
-uv run playwright install chromium
+# 浏览器相关测试或本地登录可安装 CloakBrowser，或设置 CLOAKBROWSER_BINARY_PATH 指向本地浏览器
+uv run python -m cloakbrowser install
 
 # 运行测试
 uv run pytest tests/
