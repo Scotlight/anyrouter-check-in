@@ -129,6 +129,156 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
+async def login_with_password(
+	account_name: str,
+	login_url: str,
+	username: str,
+	password: str,
+	api_user_key: str = 'new-api-user',
+	waf_cookie_names: list[str] | None = None,
+) -> tuple[dict | None, str | None]:
+	"""使用 Playwright 通过账号密码登录（适用于「登录即签到」平台）
+
+	每次使用全新临时 user_data_dir，等价于退出后重新登录。
+	返回 (cookies_dict, api_user)，登录失败返回 (None, None)。
+	"""
+	print(f'[PROCESSING] {account_name}: Starting browser to login with credentials...')
+
+	async with async_playwright() as p:
+		import tempfile
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--disable-web-security',
+					'--disable-features=VizDisplayCompositor',
+					'--no-sandbox',
+				],
+			)
+
+			page = await context.new_page()
+
+			# 登录成功后才开始拦截请求，抓取 api_user
+			captured_api_user = None
+			listen_enabled = False
+
+			def on_request(request):
+				nonlocal captured_api_user
+				if not listen_enabled or captured_api_user:
+					return
+				headers = request.headers
+				for key, value in headers.items():
+					if key.lower() == api_user_key.lower() and value:
+						# 过滤掉未登录时的无效值（-1、0 等）
+						try:
+							if int(value) <= 0:
+								continue
+						except ValueError:
+							pass
+						captured_api_user = value
+						print(f'[INFO] {account_name}: Captured api_user={value} from request header')
+						break
+
+			page.on('request', on_request)
+
+			try:
+				print(f'[PROCESSING] {account_name}: Opening login page {login_url}...')
+				await page.goto(login_url, wait_until='networkidle')
+
+				try:
+					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+				except Exception:
+					await page.wait_for_timeout(3000)
+
+				# 点击「使用 邮箱或用户名 登录」按钮切换到账号密码表单
+				try:
+					email_login_btn = page.locator(
+						'button:has-text("邮箱"), button:has-text("用户名"), button:has-text("账号")'
+					).first
+					if await email_login_btn.count() > 0:
+						await email_login_btn.click()
+						await page.wait_for_timeout(500)
+						print(f'[INFO] {account_name}: Switched to email/username login form')
+				except Exception:
+					pass
+
+				# 填写用户名
+				username_input = page.locator('input[name="username"], input[id="username"]').first
+				if await username_input.count() == 0:
+					username_input = page.locator(
+						'input:not([type="password"]):not([type="hidden"]):not([type="checkbox"])'
+					).first
+				await username_input.fill(username)
+
+				# 填写密码
+				password_input = page.locator('input[type="password"]').first
+				await password_input.fill(password)
+
+				print(f'[INFO] {account_name}: Credentials filled, submitting login form...')
+
+				# 点击登录按钮
+				submit_btn = page.locator('button[type="submit"]').first
+				if await submit_btn.count() == 0:
+					submit_btn = page.locator(
+						'button:has-text("登录"), button:has-text("Login"), button:has-text("Sign in")'
+					).first
+				await submit_btn.click()
+
+				# 等待登录成功：URL 离开 /login 页
+				try:
+					await page.wait_for_url(lambda url: '/login' not in url, timeout=20000)
+				except Exception:
+					await page.wait_for_load_state('networkidle', timeout=20000)
+
+				await page.wait_for_timeout(2000)
+
+				current_url = page.url
+				if '/login' in current_url:
+					print(f'[FAILED] {account_name}: Login failed, still on login page ({current_url})')
+					await context.close()
+					return None, None
+
+				print(f'[SUCCESS] {account_name}: Login successful, redirected to {current_url}')
+
+				# 登录成功，开始拦截请求以抓取 api_user
+				listen_enabled = True
+				# 刷新页面让前端用已登录身份发 API 请求
+				await page.reload(wait_until='networkidle')
+				await page.wait_for_timeout(3000)
+
+				# 提取浏览器中的所有 cookies
+				cookies = await page.context.cookies()
+				cookie_dict = {c['name']: c['value'] for c in cookies if c.get('value')}
+				print(f'[INFO] {account_name}: Got {len(cookie_dict)} cookies after login')
+
+				if 'session' not in cookie_dict:
+					print(f'[WARNING] {account_name}: "session" cookie not found, login may not have completed')
+
+				if waf_cookie_names:
+					missing = [c for c in waf_cookie_names if c not in cookie_dict]
+					if missing:
+						print(f'[WARNING] {account_name}: Missing WAF cookies after login: {missing}')
+
+				if captured_api_user:
+					print(f'[SUCCESS] {account_name}: Auto-detected api_user: {captured_api_user}')
+				else:
+					print(f'[WARNING] {account_name}: Could not auto-detect api_user from network requests')
+
+				await context.close()
+				return cookie_dict, captured_api_user
+
+			except Exception as e:
+				print(f'[FAILED] {account_name}: Error occurred during password login: {e}')
+				await context.close()
+				return None, None
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -264,18 +414,35 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	user_cookies = parse_cookies(account.cookies)
-	if not user_cookies:
-		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+	if account.username and account.password:
+		# 账号密码登录：适用于 AgentRouter 等「登录即签到」平台
+		login_url = f'{provider_config.domain}{provider_config.login_path}'
+		all_cookies, captured_api_user = await login_with_password(
+			account_name,
+			login_url,
+			account.username,
+			account.password,
+			provider_config.api_user_key,
+			provider_config.waf_cookie_names,
+		)
+		if not all_cookies:
+			return False, None, None
+		# 优先用自动抓取的 api_user，其次用配置里手动填的
+		effective_api_user = captured_api_user or account.api_user
+	else:
+		user_cookies = parse_cookies(account.cookies)
+		if not user_cookies:
+			print(f'[FAILED] {account_name}: Invalid configuration format')
+			return False, None, None
 
-	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-	if not all_cookies:
-		return False, None
+		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		if not all_cookies:
+			return False, None, None
+		effective_api_user = account.api_user
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -293,7 +460,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			'Sec-Fetch-Dest': 'empty',
 			'Sec-Fetch-Mode': 'cors',
 			'Sec-Fetch-Site': 'same-origin',
-			provider_config.api_user_key: account.api_user,
+			provider_config.api_user_key: effective_api_user,
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
