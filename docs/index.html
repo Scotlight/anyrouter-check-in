@@ -667,8 +667,8 @@
                 '</div>' +
                 '<div class="password-fields" id="password-fields-' + id + '" style="display:' + passwordDisplay + ';">' +
                     '<div class="form-group">' +
-                        '<label>用户名 / 邮箱 <span style="color:var(--danger)">*</span></label>' +
-                        '<input type="text" id="username-' + id + '" placeholder="输入登录用户名或邮箱地址">' +
+                        '<label>邮箱 / 用户名 <span style="color:var(--danger)">*</span></label>' +
+                        '<input type="text" id="email-' + id + '" placeholder="输入登录邮箱或用户名">' +
                     '</div>' +
                     '<div class="form-group">' +
                         '<label>密码 <span style="color:var(--danger)">*</span></label>' +
@@ -888,11 +888,11 @@
                         accounts.push(acc);
                     }
                 } else if (mode === 'password') {
-                    var username = document.getElementById('username-' + id).value.trim();
+                    var email = document.getElementById('email-' + id).value.trim();
                     var password = document.getElementById('password-' + id).value.trim();
-                    if (username && password) {
+                    if (email && password) {
                         var acc = {
-                            username: username,
+                            email: email,
                             password: password
                         };
                         if (name) acc.name = name;

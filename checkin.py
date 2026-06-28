@@ -418,13 +418,14 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
-	if account.username and account.password:
+	if account.has_login_credentials():
 		# 账号密码登录：适用于 AgentRouter 等「登录即签到」平台
+		assert account.email and account.password
 		login_url = f'{provider_config.domain}{provider_config.login_path}'
 		all_cookies, captured_api_user = await login_with_password(
 			account_name,
 			login_url,
-			account.username,
+			account.email,
 			account.password,
 			provider_config.api_user_key,
 			provider_config.waf_cookie_names,

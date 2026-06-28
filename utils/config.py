@@ -139,7 +139,7 @@ class AccountConfig:
 	api_user: str = ''
 	provider: str = 'anyrouter'
 	name: str | None = None
-	username: str | None = None
+	email: str | None = None
 	password: str | None = None
 
 	@classmethod
@@ -153,9 +153,13 @@ class AccountConfig:
 			api_user=data.get('api_user', ''),
 			provider=provider,
 			name=name if name else None,
-			username=data.get('username'),
+			email=data.get('email') or data.get('username'),
 			password=data.get('password'),
 		)
+
+	def has_login_credentials(self) -> bool:
+		"""是否配置了邮箱密码登录"""
+		return bool(self.email and self.password)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -183,10 +187,10 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				return None
 
 			has_cookies = 'cookies' in account_dict and 'api_user' in account_dict
-			has_credentials = 'username' in account_dict and 'password' in account_dict
+			has_credentials = ('email' in account_dict or 'username' in account_dict) and 'password' in account_dict
 
 			if not has_cookies and not has_credentials:
-				print(f'ERROR: Account {i + 1} missing required fields (need cookies+api_user or username+password)')
+				print(f'ERROR: Account {i + 1} must have either cookies+api_user or email+password')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

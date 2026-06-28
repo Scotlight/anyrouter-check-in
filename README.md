@@ -42,7 +42,7 @@
 
 #### 模式二：密码登录模式（适用于 AgentRouter 等「登录即签到」平台）
 
-1. **Username**: 登录邮箱或用户名
+1. **Email**: 登录邮箱或用户名
 2. **Password**: 登录密码
 
 > AgentRouter 的签到机制是「退出重新登录」才算签到，使用密码登录模式时脚本会自动通过 Playwright 模拟登录流程完成签到，`api_user` 会从登录后的网络请求中自动获取，无需手动填写。
@@ -86,7 +86,7 @@
   {
     "name": "AgentRouter 账号",
     "provider": "agentrouter",
-    "username": "your@email.com",
+    "email": "your@email.com",
     "password": "yourpassword"
   }
 ]
@@ -99,7 +99,7 @@
 - `api_user` (必需)：用于请求头的 new-api-user 参数
 
 **密码登录模式（二选一）**：
-- `username` (必需)：登录邮箱或用户名
+- `email` (必需)：登录邮箱或用户名
 - `password` (必需)：登录密码
 - `api_user` 会自动从登录后的网络请求中获取，无需手动填写
 
@@ -193,7 +193,7 @@
   {
     "name": "AgentRouter 账号",
     "provider": "agentrouter",
-    "username": "your@email.com",
+    "email": "your@email.com",
     "password": "yourpassword"
   }
 ]
