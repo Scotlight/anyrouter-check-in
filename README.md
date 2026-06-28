@@ -19,6 +19,7 @@
 
 - ✅ 多平台（兼容 NewAPI 与 OneAPI）
 - ✅ 单个/多账号自动签到
+- ✅ 支持密码登录签到（适用于 AgentRouter 等「登录即签到」平台）
 - ✅ 多种机器人通知（可选）
 - ✅ 绕过 WAF 限制
 
@@ -30,10 +31,21 @@
 
 ### 2. 获取账号信息
 
-对于每个需要签到的账号，你需要获取：(可借助 [在线 Secrets 配置生成器](https://millylee.github.io/anyrouter-check-in/))
+对于每个需要签到的账号，你需要获取：(可借助 [在线 Secrets 配置生成器](https://scotlight.github.io/anyrouter-check-in/))
+
+支持两种签到模式：
+
+#### 模式一：Cookie 模式（适用于 AnyRouter 等）
 
 1. **Cookies**: 用于身份验证
 2. **API User**: 用于请求头的 new-api-user 参数（自己配置其它平台时该值需要注意匹配）
+
+#### 模式二：密码登录模式（适用于 AgentRouter 等「登录即签到」平台）
+
+1. **Username**: 登录邮箱或用户名
+2. **Password**: 登录密码
+
+> AgentRouter 的签到机制是「退出重新登录」才算签到，使用密码登录模式时脚本会自动通过 Playwright 模拟登录流程完成签到，`api_user` 会从登录后的网络请求中自动获取，无需手动填写。
 
 #### 获取 Cookies：
 
@@ -60,7 +72,7 @@
 
 ### 4. 多账号配置格式
 
-支持单个与多个账号配置，可选 `name` 和 `provider` 字段：
+支持单个与多个账号配置，支持 Cookie 模式和密码登录模式：
 
 ```json
 [
@@ -72,20 +84,26 @@
     "api_user": "account1_api_user_id"
   },
   {
-    "name": "备用账号",
+    "name": "AgentRouter 账号",
     "provider": "agentrouter",
-    "cookies": {
-      "session": "account2_session_value"
-    },
-    "api_user": "account2_api_user_id"
+    "username": "your@email.com",
+    "password": "yourpassword"
   }
 ]
 ```
 
 **字段说明**：
 
+**Cookie 模式（二选一）**：
 - `cookies` (必需)：用于身份验证的 cookies 数据
 - `api_user` (必需)：用于请求头的 new-api-user 参数
+
+**密码登录模式（二选一）**：
+- `username` (必需)：登录邮箱或用户名
+- `password` (必需)：登录密码
+- `api_user` 会自动从登录后的网络请求中获取，无需手动填写
+
+**通用字段**：
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -158,9 +176,9 @@
 ]
 ```
 
-### 多服务商配置
+### 多服务商配置（含密码登录模式）
 
-如果你需要同时使用多个服务商（如 anyrouter 和 agentrouter）：
+如果你需要同时使用多个服务商，Cookie 模式和密码登录模式可以混用：
 
 ```json
 [
@@ -173,12 +191,10 @@
     "api_user": "user123"
   },
   {
-    "name": "AgentRouter 备用",
+    "name": "AgentRouter 账号",
     "provider": "agentrouter",
-    "cookies": {
-      "session": "xyz789session"
-    },
-    "api_user": "user456"
+    "username": "your@email.com",
+    "password": "yourpassword"
   }
 ]
 ```
